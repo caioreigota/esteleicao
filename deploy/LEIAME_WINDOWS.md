@@ -1,89 +1,101 @@
-# Publicar o painel num servidor Windows (NSSM)
+# Publicar o painel no servidor Windows (Caddy + NSSM)
 
-O painel roda como um serviço do Windows (via NSSM), numa porta própria, igual
-aos seus outros sites Python. O servidor **não precisa baixar nada do TSE**: ele
-só usa os arquivos já processados (`.parquet`) que você gerou no Mac.
+```
+navegador ──https──> Caddy (portas 80/443, já roda no NSSM)
+                        │  deploy\Caddyfile.est: esteleicao.com -> 127.0.0.1:8503
+                        ▼
+                     painel Streamlit (serviço "esteleicao" no NSSM, só interno)
+```
+
+O Caddy só encaminha as requisições; ele não executa Python. Por isso o painel
+roda como um serviço próprio no NSSM, ouvindo **só internamente** em
+`127.0.0.1:8503` (nenhuma porta nova aberta para a internet).
+
+O servidor **não precisa baixar nada do TSE**: ele usa os dados já processados
+(`.parquet`) que você gerou no Mac.
 
 ## 1. No Mac: gerar o pacote
 
-Na pasta do projeto, com o ambiente ativado:
-
 ```bash
+cd ~/Git/esteleicao
+source .venv/bin/activate
 python deploy/empacotar.py
 ```
 
-Isso cria `pacote_servidor.zip` (código + `dados/secoes_*.parquet` +
-`dados/logs_*.parquet`). Copie esse arquivo para o servidor.
+Isso cria `pacote_servidor.zip` (código + `dados/*.parquet`, ~60 MB).
 
-## 2. No servidor: extrair
+## 2. No servidor: copiar o pacote
 
-Extraia, por exemplo, em `C:\sites\` — vai ficar `C:\sites\esteleicao\`.
-
-Requisitos: Python 3.10 ou mais novo (o mesmo dos outros sites serve) e o
-`nssm.exe` no PATH. A máquina precisa de **~1,5 GB de RAM livre** para o painel
-(a base tem ~500 mil seções e fica carregada em memória, compartilhada entre os
-visitantes).
-
-## 3. No servidor: instalar o serviço
-
-Abra o **PowerShell como Administrador**:
+Copie `pacote_servidor.zip` para `C:\git\` e, no PowerShell:
 
 ```powershell
-cd C:\sites\esteleicao
+Expand-Archive C:\git\pacote_servidor.zip -DestinationPath C:\git -Force
+```
+
+Isso atualiza `C:\git\esteleicao\` (código e pasta `dados`).
+
+## 3. No servidor: instalar o serviço do painel
+
+PowerShell **como Administrador**:
+
+```powershell
+cd C:\git\esteleicao
 Get-ChildItem -Recurse | Unblock-File
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\deploy\instalar_servico_windows.ps1 -Porta 8503 -AbrirFirewall
+.\deploy\instalar_servico_windows.ps1
 ```
 
-O script cria o `.venv`, instala as dependências, registra o serviço
-`esteleicao` no NSSM (início automático, reinício em caso de falha, logs em
-`logs\servico.log`), libera a porta no firewall e testa se o painel respondeu.
+O script cria o `.venv` com as bibliotecas (por isso não use o `python` direto:
+ele não tem o pandas), registra o serviço `esteleicao` no NSSM (início
+automático, reinício em caso de falha, log em `logs\servico.log`) e testa se o
+painel respondeu em `http://localhost:8503`.
 
-Use uma porta que os outros dois sites não usam. Para ver as portas ocupadas:
+## 4. No servidor: ativar no Caddy
+
+O Caddyfile principal precisa ter a linha (você já incluiu):
+
+```
+import C:/git/esteleicao/deploy/Caddyfile.est
+```
+
+Reinicie o serviço do Caddy no NSSM para ele ler a configuração:
 
 ```powershell
-Get-NetTCPConnection -State Listen | Sort-Object LocalPort | Select-Object LocalPort, OwningProcess
+nssm restart NOME-DO-SERVICO-DO-CADDY
 ```
 
-Depois disso o painel fica em `http://IP-DO-SERVIDOR:8503/`. Se o servidor
-estiver atrás de um roteador/nuvem, libere a mesma porta lá também (ex.: grupo
-de segurança da VM ou redirecionamento de porta).
+Requisitos do domínio (os mesmos do duad.live): o DNS de `esteleicao.com` e
+`www.esteleicao.com` apontando para o IP do servidor. O Caddy emite o
+certificado HTTPS sozinho; `http://` e `www.` redirecionam para
+`https://esteleicao.com`.
 
-### Opções do script
-
-| Opção | Para quê |
-|---|---|
-| `-Porta 8504` | outra porta |
-| `-NomeServico eleicao2026` | outro nome de serviço |
-| `-Certificado C:\certs\cert.pem -ChavePrivada C:\certs\key.pem` | HTTPS direto no Streamlit |
-| `-CaminhoBase eleicao` | publicar em `http://servidor:porta/eleicao/` |
-| `-Endereco 127.0.0.1 -Dominio https://eleicao.seusite.com.br` | se um dia colocar IIS/nginx na frente (o `-Dominio` é obrigatório nesse caso, senão o navegador é recusado) |
-| `-Python C:\Python312\python.exe` | escolher qual Python cria o `.venv` |
-| `-Nssm C:\tools\nssm.exe` | se o nssm não estiver no PATH |
-
-Rodar o script de novo **atualiza** o serviço existente (não duplica).
-
-## 4. Atualizar os dados ou o código
+## Atualizar depois
 
 1. No Mac: `python deploy/empacotar.py`
-2. No servidor: extraia por cima de `C:\sites\esteleicao\`
+2. No servidor: `Expand-Archive C:\git\pacote_servidor.zip -DestinationPath C:\git -Force`
 3. No servidor: `nssm restart esteleicao`
 
-## Comandos úteis no servidor
+## Comandos úteis
 
 ```powershell
 nssm status esteleicao
 nssm restart esteleicao
-nssm stop esteleicao
-nssm edit esteleicao
-Get-Content C:\sites\esteleicao\logs\servico.log -Tail 50
+Get-Content C:\git\esteleicao\logs\servico.log -Tail 50
+```
+
+## Se for rodar os scripts de download no servidor
+
+Use sempre o Python do `.venv` (criado no passo 3):
+
+```powershell
+C:\git\esteleicao\.venv\Scripts\python.exe baixar_dados.py
+C:\git\esteleicao\.venv\Scripts\python.exe baixar_logs.py
 ```
 
 ## Problemas comuns
 
-- **Página abre mas fica "Connecting..." / "Please wait"**: algo entre o
-  navegador e o servidor está bloqueando WebSocket (proxy, firewall corporativo).
-  Se houver um proxy na frente, reinstale com `-Endereco 127.0.0.1 -Dominio https://seu-endereco`.
-- **Serviço para sozinho**: veja `logs\servico.log`. Falta de memória aparece
-  como `MemoryError`.
-- **"Nenhum dado encontrado"**: faltou a pasta `dados` com os `.parquet`.
+- **Página abre mas fica em "Connecting..."**: o painel não está rodando
+  (`nssm status esteleicao`) ou o Caddy não foi reiniciado.
+- **Erro de certificado**: o DNS do domínio ainda não aponta para o servidor.
+- **Serviço para sozinho**: veja `logs\servico.log`. O painel precisa de
+  ~1 GB de RAM, mais ~150–200 MB por visitante simultâneo.

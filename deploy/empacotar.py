@@ -17,6 +17,7 @@ arquivos = [
     RAIZ / "README.md",
     *(RAIZ / "deploy").glob("*.ps1"),
     *(RAIZ / "deploy").glob("*.md"),
+    *(RAIZ / "deploy").glob("Caddyfile*"),
     *(RAIZ / "dados").glob("secoes_*.parquet"),
     *(RAIZ / "dados").glob("logs_*.parquet"),
 ]

@@ -1,21 +1,20 @@
-# Bloco do Duad Live, importado pelo Caddyfile do veracibot
+# Bloco do painel esteleicao, importado pelo Caddyfile principal
 # (C:\Git\veracibot\deploy\windows\Caddyfile) com a linha:
-#   import C:/Git/duadlive/deploy/Caddyfile.duad
+#   import C:/git/esteleicao/deploy/Caddyfile.est
 #
-# AJUSTE o caminho em "root" se o repositorio estiver em outra pasta no servidor.
+# O painel (Streamlit) roda como servico "esteleicao" no NSSM, ouvindo SO
+# internamente em 127.0.0.1:8503 (instalado por deploy\instalar_servico_windows.ps1).
+# O Caddy publica em esteleicao.com nas portas padrao, com HTTPS automatico
+# (quem acessar http://esteleicao.com e redirecionado para https).
+# O reverse_proxy do Caddy ja repassa WebSocket, que o Streamlit usa.
+#
+# AJUSTE a porta abaixo se instalar o servico com outra (-Porta).
 
-duad.live {
-	root * C:/Git/duadlive/site
+esteleicao.com {
 	encode gzip
-
-	# Na fase de testes, sempre servir a versao mais recente do arquivo
-	header Cache-Control "no-cache"
-
-	# A raiz abre site/index.html (estudio e visualizador); o banco de testes fica em /proto.html
-
-	file_server
+	reverse_proxy 127.0.0.1:8503
 }
 
-www.duad.live {
+www.esteleicao.com {
 	redir https://esteleicao.com{uri} permanent
 }

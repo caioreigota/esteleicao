@@ -9,13 +9,15 @@
     4. Inicia o servico e testa se respondeu
 
     Rode no PowerShell COMO ADMINISTRADOR, dentro da pasta do projeto:
-        .\deploy\instalar_servico_windows.ps1 -Porta 8503 -AbrirFirewall
+        .\deploy\instalar_servico_windows.ps1
+    O painel fica em 127.0.0.1:8503 (so interno); o Caddy publica em esteleicao.com
+    (veja deploy\Caddyfile.est).
 
 .PARAMETER Porta
     Porta em que o painel vai atender (padrao 8503). Use uma porta livre, diferente dos outros sites.
 .PARAMETER Endereco
-    0.0.0.0 (padrao) atende em todas as interfaces (acesso direto pela internet).
-    Use 127.0.0.1 se for colocar um proxy (IIS, nginx...) na frente.
+    127.0.0.1 (padrao): so interno, atras do Caddy/proxy.
+    0.0.0.0: atende direto pela internet na porta escolhida (use com -AbrirFirewall).
 .PARAMETER Dominio
     So necessario atras de proxy: endereco publico, ex. https://eleicao.meusite.com.br
 .PARAMETER CaminhoBase
@@ -29,7 +31,7 @@
 #>
 param(
     [int]$Porta = 8503,
-    [string]$Endereco = "0.0.0.0",
+    [string]$Endereco = "127.0.0.1",
     [string]$NomeServico = "esteleicao",
     [string]$Dominio = "",
     [string]$CaminhoBase = "",
@@ -146,7 +148,12 @@ for ($i = 0; $i -lt 30 -and -not $ok; $i++) {
 if ($ok) {
     Write-Host "`nOK: o painel esta no ar." -ForegroundColor Green
     Write-Host "   Neste servidor:   ${esquema}://localhost:$Porta$sub/"
-    Write-Host "   Pela internet:    ${esquema}://<IP-ou-dominio-do-servidor>:$Porta$sub/"
+    if ($Endereco -eq "127.0.0.1") {
+        Write-Host "   Pela internet:    via Caddy (deploy\Caddyfile.est) -> https://esteleicao.com/"
+        Write-Host "   Depois de instalar, reinicie o servico do Caddy no NSSM para ele ler o Caddyfile.est."
+    } else {
+        Write-Host "   Pela internet:    ${esquema}://<IP-ou-dominio-do-servidor>:$Porta$sub/"
+    }
     Write-Host "   A 1a abertura demora alguns segundos (carrega ~500 mil secoes)."
 } else {
     Write-Host "`nO servico nao respondeu em 60 s. Veja o log: $LogArq" -ForegroundColor Yellow
