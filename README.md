@@ -1,36 +1,67 @@
-# Abstenção por seção eleitoral — Eleições 2026
+# Abstenção, horário de votação e identificação do eleitor por seção — Eleições 2026
 
 Baixa os dados oficiais do TSE de comparecimento/abstenção de **todas as seções
-eleitorais** e abre um painel interativo (estilo BI) com média e desvio padrão
-por Brasil → estado → município → zona → seção, sinalizando seções com
-abstenção fora do padrão.
+eleitorais** e os **logs das urnas** (horário de cada voto e se o eleitor foi
+identificado pela digital), e abre um painel
+interativo (estilo BI) com média e desvio padrão por Brasil → estado →
+município → zona → seção. Sinaliza seções com abstenção fora do padrão, votação
+concentrada no fim do dia, muitos eleitores liberados sem digital e,
+principalmente, essas coisas acontecendo juntas.
 
 ## Como usar
 
-Requer Python 3.10+.
+Requer Python 3.9+. No macOS o comando é `python3` (se não existir, o sistema
+oferece instalar as "Command Line Tools"; aceite).
+
+Na primeira vez, dentro da pasta do projeto:
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 
-python baixar_dados.py            # baixa ~centenas de MB do TSE e gera dados/secoes_2026_t1.parquet
-streamlit run painel.py           # abre o painel no navegador (http://localhost:8501)
+python baixar_dados.py
+streamlit run painel.py
 ```
+
+Nas próximas vezes, basta `source .venv/bin/activate` e `streamlit run painel.py`.
+
+### Logs de urna (horário dos votos)
+
+```bash
+python baixar_logs.py --ufs AC
+python baixar_logs.py --ufs SP --apagar-zip
+python baixar_logs.py
+```
+
+Os arquivos do TSE ("Arquivos transmitidos para totalização") vêm **um zip por
+UF** e incluem também as imagens dos boletins, por isso são grandes: de
+centenas de MB (estados pequenos) a dezenas de GB (SP, MG). O download é
+retomado se for interrompido; `--apagar-zip` libera o espaço depois de
+processar. O processamento lê ~800 logs/s por núcleo de CPU. O painel junta
+os logs automaticamente quando o arquivo `dados/logs_2026_t1_<UF>.parquet`
+existe. Fonte:
+<https://dadosabertos.tse.jus.br/dataset/resultados-2026-arquivos-transmitidos-para-totalizacao>
 
 Outras opções:
 
 ```bash
-python baixar_dados.py --turno 2                     # 2º turno (25/10), quando o TSE publicar
-python baixar_dados.py --ano 2022                    # eleição anterior, para comparar
-python baixar_dados.py --zip caminho/do/arquivo.zip  # se baixou o zip pelo navegador
+python baixar_dados.py --turno 2
+python baixar_dados.py --ano 2022
+python baixar_dados.py --zip caminho/do/arquivo.zip
 ```
 
 Se o download falhar, baixe manualmente o arquivo **"Detalhe da apuração por
 seção eleitoral"** em <https://dadosabertos.tse.jus.br/dataset/resultados-2026>
 e use `--zip`.
 
-Para testar sem baixar nada: `python gerar_dados_teste.py` e depois
-`python baixar_dados.py --ano 1999 --zip dados/teste_detalhe_votacao_secao.zip`
-(dados inventados com 12 anomalias plantadas).
+Para testar sem baixar nada (dados inventados, com anomalias plantadas):
+
+```bash
+python gerar_dados_teste.py
+python baixar_dados.py --ano 1999 --zip dados/teste_detalhe_votacao_secao.zip
+for f in dados/teste_arqurna_*.zip; do python baixar_logs.py --zip $f; done
+```
 
 ## O painel
 
@@ -39,7 +70,10 @@ Para testar sem baixar nada: `python gerar_dados_teste.py` e depois
 - **Distribuição**: histograma das seções com linhas de média, ±1 e ±2 desvios.
 - **Funil**: abstenção × tamanho da seção, com limites de ±2 e ±3 desvios esperados para cada tamanho.
 - **Seções sinalizadas**: lista ordenada, exportável em CSV; clicar numa linha abre o detalhe.
-- **Detalhe da seção**: seção vs zona, município, UF e Brasil; percentis; abstenções esperadas; e as outras seções do **mesmo local de votação**.
+- **Horário dos votos**: % dos votos em cada hora, hora média por subunidade (média ± desvio), distribuição por seção e lista das seções com mais votos após 17h.
+- **Sem digital**: % de eleitores liberados sem digital hora a hora (separando "sem cadastro" de "liberação manual"), média ± desvio por subunidade, gráfico proporção × tamanho da seção e lista das seções acima do esperado.
+- **Cruzamento**: escolha na barra lateral quais critérios precisam valer ao mesmo tempo (abstenção baixa, votação tardia, muitos sem digital, liberação manual alta). Cada seção vira um ponto; as que passam em todos os critérios ficam destacadas e listadas com os sinais encontrados no log.
+- **Detalhe da seção**: seção vs zona, município, UF e Brasil; percentis; abstenções esperadas; perfil hora a hora comparado com as outras seções da mesma escola e com o município; e as outras seções do **mesmo local de votação**.
 
 ## Como uma seção é sinalizada
 
@@ -51,6 +85,72 @@ município tem menos de 5 seções, a comparação é com a UF.
 | z simples | (taxa − média) / desvio padrão | O que se pede intuitivamente, mas seções pequenas variam muito por acaso e dominam a lista. |
 | z binomial | (faltaram − esperado) / √(aptos·p·(1−p)) | Considera o tamanho da seção, mas supõe que só o acaso separa as seções — sinaliza milhares. |
 | **z ajustado** (padrão) | (taxa − esperada) / √(p(1−p)/aptos + τ²) | τ² é a variação natural entre seções (perfil etário, renda, cadastro desatualizado), estimada por UF de forma robusta. É o modelo de efeitos aleatórios usado em *funnel plots*. Com \|z\| ≥ 3, sinaliza poucas seções de verdade. |
+
+## Horário dos votos: o que é medido
+
+O log (`logd.dat`, dentro do `-log.jez` em 2026, que é um zip, ou do `.logjez` em
+2022, que é um 7z) registra cada evento da urna com data e
+hora. Cada linha "O voto do eleitor foi computado" é um voto; a linha
+"Tipo de habilitação do eleitor [biométrica]" antes dele indica que o eleitor
+foi liberado pela digital. Linhas de dias anteriores (testes, carga) são
+ignoradas.
+
+**Fuso horário**: a votação é de 8h às 17h no horário de Brasília em todo o
+país, mas a urna marca a hora local (no AM/MT/MS/RO/RR abre às 7h locais; no
+AC, às 6h). O fuso de cada seção é estimado pela hora em que a urna ficou
+pronta para o primeiro eleitor e harmonizado pelo fuso mais comum do
+município. Todos os horários do painel estão em horário de Brasília.
+
+| Métrica | O que é |
+|---|---|
+| hora média | média do horário dos votos da seção |
+| z horário | (hora média − mediana do município) ÷ dispersão robusta (MAD) do município. Positivo = mais tarde |
+| % após 17h | votos computados depois do encerramento |
+| sem biometria após 17h | % dos votos depois das 17h sem habilitação por digital |
+| urna ociosa antes das 17h | maior intervalo sem votos entre 16h e 17h |
+| dif. para a escola | minutos de diferença para a média das outras seções do mesmo local |
+| **score cruzado** | min(−z da abstenção, z do horário): só é alto se a seção tiver **ao mesmo tempo** abstenção baixa e votação tardia |
+
+Sinais listados por seção: ≥10% dos votos após 17h · urna ociosa ≥20 min antes
+das 17h mas com votos depois · maioria sem biometria após 17h · votos após 17h
+em ritmo muito rápido (≤45 s) · 1h+ mais tarde que as outras seções da escola ·
+votos no log ≠ comparecimento oficial · urna substituída · abertura atrasada.
+
+## Identificação do eleitor (digital)
+
+Para cada voto, o log mostra como o eleitor foi liberado:
+
+| Tipo | Mensagem no log | O que significa |
+|---|---|---|
+| Digital | `Tipo de habilitação do eleitor [biométrica]` | digital reconhecida |
+| Sem cadastro | `O eleitor não possui biometria` (2022) ou liberação pelo ano de nascimento sem nenhuma tentativa de digital (2026) | o eleitor não tem digital cadastrada na Justiça Eleitoral |
+| **Liberação manual** | `Solicitação de dado pessoal do eleitor para habilitação manual` | o eleitor **tem** digital cadastrada, ela não foi reconhecida em 4 tentativas e o **mesário liberou** o voto com a digital dele |
+
+Indicadores por seção:
+
+| Métrica | O que é |
+|---|---|
+| % sem digital | (sem cadastro + liberação manual) ÷ votos |
+| % liberação manual | liberação manual ÷ eleitores que têm digital cadastrada |
+| z sem digital / z manual | mesmo método do z ajustado da abstenção: compara com o próprio município, considerando o tamanho da seção e a variação natural entre seções |
+| maior sequência manual | maior número de eleitores **seguidos** liberados pelo mesário |
+| dif. para a escola | p.p. de diferença no % sem digital para as outras seções do mesmo local |
+
+Sinais: sem digital muito acima do município (z ≥ 3) · liberação manual muito
+acima do município (z ≥ 3) · 8+ liberações manuais seguidas · sem digital 25+
+p.p. acima das outras seções da escola · maioria sem biometria após 17h.
+
+**Cuidado ao interpretar**: liberar sem digital é previsto em lei e comum
+(cerca de 1 em cada 5 eleitores). "Sem cadastro" depende sobretudo do
+cadastro biométrico da região (eleitores novos, regiões onde a revisão
+biométrica não chegou), e costuma atingir **a escola inteira**. A liberação
+manual de quem tem digital também acontece por motivos comuns: idosos,
+trabalhadores braçais com digitais gastas, leitor sujo ou com defeito. Um
+leitor com defeito, aliás, pode gerar uma longa sequência de liberações
+manuais legítimas, e a ata da seção deve registrar isso. O indicador mais
+específico é a **liberação manual**, muito acima do município, **em sequência**,
+numa seção que destoa das outras da mesma escola, e se possível junto com
+abstenção baixa e/ou votos após as 17h.
 
 ## Como interpretar (importante)
 
@@ -77,3 +177,16 @@ mais informativo para investigar um ponto sinalizado é:
 
 Com cerca de 470 mil seções, mesmo uma regra muito rigorosa vai listar
 dezenas a centenas de seções só por acaso estatístico.
+
+**Sobre o horário**: votar depois das 17h é legal: quem está na fila às 17h
+vota. No 1º turno de 2022 foram cerca de 4 milhões de votos após as 17h. E
+abstenção baixa e votação tardia andam juntas naturalmente: mais eleitores
+comparecendo → mais fila. Causas comuns de votação tardia: fila na escola,
+problemas de biometria (cada eleitor demora mais), urna substituída, abertura
+atrasada, seções agregadas. O que separa fila de algo estranho é o contexto:
+
+- fila de verdade atinge **a escola inteira** e vem precedida de uma última hora
+  **cheia** (sem intervalos);
+- uma seção que ficou **ociosa antes das 17h** e depois recebeu uma **rajada de
+  votos sem biometria**, enquanto as outras seções da escola encerraram
+  normalmente, merece um olhar no boletim, no log e na ata da seção.
