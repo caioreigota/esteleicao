@@ -179,6 +179,8 @@ def juntar_horario(secoes: pd.DataFrame, logs: pd.DataFrame | None) -> pd.DataFr
         df["secoes_no_local"] = cont
 
     df["score_cruzado"] = np.minimum(-df["z_ajustado"], df["z_horario"])
+    # % dos votos após 17h comparado com o município (mesmo método das demais proporções)
+    df["z_apos_17"], df["apos_17_esperado"] = z_proporcao(df, df["votos_apos_17"], df["votos_log"])
 
     # ---- habilitação sem digital
     if "votos_digital" in df:

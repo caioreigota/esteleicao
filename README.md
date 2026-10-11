@@ -26,21 +26,41 @@ streamlit run painel.py
 
 Nas próximas vezes, basta `source .venv/bin/activate` e `streamlit run painel.py`.
 
-### Logs de urna (horário dos votos)
+### Logs de urna (horário dos votos e identificação do eleitor)
 
 ```bash
 python baixar_logs.py --ufs AC
-python baixar_logs.py --ufs SP --apagar-zip
+python baixar_logs.py --ufs CE BA
 python baixar_logs.py
 ```
 
 Os arquivos do TSE ("Arquivos transmitidos para totalização") vêm **um zip por
-UF** e incluem também as imagens dos boletins, por isso são grandes: de
-centenas de MB (estados pequenos) a dezenas de GB (SP, MG). O download é
-retomado se for interrompido; `--apagar-zip` libera o espaço depois de
-processar. O processamento lê ~800 logs/s por núcleo de CPU. O painel junta
-os logs automaticamente quando o arquivo `dados/logs_2026_t1_<UF>.parquet`
-existe. Fonte:
+UF**, com boletins, RDV, assinaturas e logs de cada seção: de centenas de MB
+(estados pequenos) a vários GB (CE ≈ 4,3 GB, BA ≈ 6,6 GB). Por isso o script,
+por padrão, **baixa só os logs** de dentro do zip (cerca de metade do
+tamanho), lendo o índice do zip e buscando cada log separadamente
+(download parcial / HTTP Range), em 8 conexões simultâneas e com novas
+tentativas automáticas. Os logs vão para `dados/logs_brutos_<ano>_<turno>t_<UF>.zip`.
+**Se cair ou você interromper (Ctrl+C), rode o mesmo comando de novo**: ele
+baixa só o que falta.
+
+Opções:
+
+- `--conexoes 4`: menos downloads simultâneos (use se aparecerem muitos erros).
+- `--completo`: baixa o zip inteiro, retomando sozinho a cada queda (plano B).
+  Também é usado automaticamente se o servidor não aceitar download parcial.
+- `--zip arquivo.zip`: processa um zip que você baixou por conta própria.
+
+Para baixar por conta própria (navegador ou `curl`, que também retoma de onde
+parou com `-C -`), mantenha o nome original do arquivo e depois use `--zip`:
+
+```bash
+curl -L -C - --retry 50 --retry-all-errors -O https://cdn.tse.jus.br/estatistica/sead/eleicoes/eleicoes2026/arqurnatot/bu_imgbu_logjez_rdv_vscmr_2026_1t_CE.zip
+python baixar_logs.py --zip bu_imgbu_logjez_rdv_vscmr_2026_1t_CE.zip
+```
+
+O processamento lê ~800 logs/s por núcleo de CPU. O painel junta os logs
+automaticamente quando o arquivo `dados/logs_2026_t1_<UF>.parquet` existe. Fonte:
 <https://dadosabertos.tse.jus.br/dataset/resultados-2026-arquivos-transmitidos-para-totalizacao>
 
 Outras opções:
@@ -69,13 +89,24 @@ for f in dados/teste_arqurna_*.zip; do python baixar_logs.py --zip $f; done
 - **Comparar**: média ± desvio padrão de cada subunidade (UFs, municípios, zonas ou locais de votação). Com muitos municípios, vira um gráfico média × desvio padrão onde quem destoa do grupo aparece isolado.
 - **Distribuição**: histograma das seções com linhas de média, ±1 e ±2 desvios.
 - **Funil**: abstenção × tamanho da seção, com limites de ±2 e ±3 desvios esperados para cada tamanho.
-- **Seções sinalizadas**: lista ordenada, exportável em CSV; clicar numa linha abre o detalhe.
+- **Sinalizadas**: seções que cumprem pelo menos 1, 2 ou os 3 critérios abaixo (escolha na barra lateral), ordenadas pelo número de critérios e pela gravidade; exportável em CSV; clicar numa linha abre o detalhe.
 - **Horário dos votos**: % dos votos em cada hora, hora média por subunidade (média ± desvio), distribuição por seção e lista das seções com mais votos após 17h.
 - **Sem digital**: % de eleitores liberados sem digital hora a hora (separando "sem cadastro" de "liberação manual"), média ± desvio por subunidade, gráfico proporção × tamanho da seção e lista das seções acima do esperado.
 - **Cruzamento**: escolha na barra lateral quais critérios precisam valer ao mesmo tempo (abstenção baixa, votação tardia, muitos sem digital, liberação manual alta). Cada seção vira um ponto; as que passam em todos os critérios ficam destacadas e listadas com os sinais encontrados no log.
 - **Detalhe da seção**: seção vs zona, município, UF e Brasil; percentis; abstenções esperadas; perfil hora a hora comparado com as outras seções da mesma escola e com o município; e as outras seções do **mesmo local de votação**.
 
 ## Como uma seção é sinalizada
+
+A aba **Sinalizadas** procura só três padrões (abstenção ALTA não é sinalizada):
+
+| Critério | Regra padrão (ajustável na barra lateral) |
+|---|---|
+| 🔻 Abstenção baixa | z da abstenção ≤ −3 (abaixo do esperado para o município) e ≥ 50 aptos |
+| ⏰ Voto após 17h | ≥ 15% dos votos depois das 17h, com pelo menos 10 votos; por padrão só conta se a hora média da seção for 30+ min mais tarde que a das outras seções da mesma escola (escola inteira tarde = fila) |
+| 🖐️ Liberação manual | z da liberação manual pelo mesário (entre eleitores com digital cadastrada) ≥ 3 e pelo menos 5 casos |
+
+Em UFs sem logs baixados, só a abstenção pode ser avaliada. Abaixo, o detalhe
+de como o z da abstenção é calculado:
 
 Cada seção é comparada com **o próprio município** (sem contar ela mesma). Se o
 município tem menos de 5 seções, a comparação é com a UF.

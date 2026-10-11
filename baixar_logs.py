@@ -3,16 +3,20 @@ Baixa os "Arquivos transmitidos para totalização" do TSE (um zip por UF com
 .bu, .imgbu, .logjez, .rdv e .vscmr de cada seção), lê os logs das urnas e
 gera, por seção, métricas do horário dos votos.
 
-Os arquivos são GRANDES (de centenas de MB a dezenas de GB por UF, pois incluem
-imagens dos boletins). Comece por um estado pequeno:
+Os arquivos do TSE são GRANDES (de centenas de MB a vários GB por UF). Por isso,
+por padrão, o script baixa SÓ os logs de dentro do zip (cerca de metade do
+tamanho), em várias conexões, com novas tentativas automáticas. Se cair ou for
+interrompido, rode de novo: ele continua de onde parou.
 
-    python baixar_logs.py --ufs AC              # testa com o Acre
-    python baixar_logs.py --ufs SP RJ MG        # alguns estados
-    python baixar_logs.py                       # todas as UFs (muito demorado)
-    python baixar_logs.py --ufs SP --apagar-zip # apaga o zip depois de processar
-    python baixar_logs.py --zip ~/Downloads/bu_imgbu_logjez_rdv_vscmr_2026_1t_AC.zip
+    python baixar_logs.py --ufs AC
+    python baixar_logs.py --ufs CE BA
+    python baixar_logs.py --ufs BA --conexoes 4
+    python baixar_logs.py --ufs CE --completo
+    python baixar_logs.py --zip ~/Downloads/bu_imgbu_logjez_rdv_vscmr_2026_1t_CE.zip
 
-O download é retomado de onde parou se for interrompido (rode de novo).
+--conexoes   número de downloads simultâneos (padrão 8; reduza se der muitos erros)
+--completo   baixa o zip inteiro em vez de só os logs (retoma sozinho se cair)
+--zip        processa um zip que você já baixou (pelo navegador, curl etc.)
 Resultado: dados/logs_<ano>_t<turno>_<UF>.parquet  (o painel lê automaticamente)
 
 Fonte: https://dadosabertos.tse.jus.br/dataset/resultados-2026-arquivos-transmitidos-para-totalizacao
@@ -32,8 +36,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import requests
-
+from download_tse import SemDownloadParcial, baixar_completo, baixar_so_logs
 from logs_urna import ABERTURA, EXT_LOG, estimar_fuso, metricas, processar_logjez
 
 URL = ("https://cdn.tse.jus.br/estatistica/sead/eleicoes/eleicoes{ano}/arqurnatot/"
@@ -41,38 +44,6 @@ URL = ("https://cdn.tse.jus.br/estatistica/sead/eleicoes/eleicoes{ano}/arqurnato
 UFS = ["AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO", "MA", "MG", "MS", "MT", "PA",
        "PB", "PE", "PI", "PR", "RJ", "RN", "RO", "RR", "RS", "SC", "SE", "SP", "TO", "ZZ"]
 PASTA = Path(__file__).parent / "dados"
-
-
-# ------------------------------------------------------------------ download
-def baixar(url: str, destino: Path) -> Path:
-    if destino.exists():
-        print(f"  zip já baixado: {destino.name}")
-        return destino
-    parcial = destino.with_suffix(".zip.part")
-    ja = parcial.stat().st_size if parcial.exists() else 0
-    cab = {"User-Agent": "Mozilla/5.0 (analise-horario-votacao)"}
-    if ja:
-        cab["Range"] = f"bytes={ja}-"
-        print(f"  retomando download a partir de {ja / 1e6:,.0f} MB")
-    with requests.get(url, stream=True, timeout=60, headers=cab) as r:
-        if r.status_code == 404:
-            raise FileNotFoundError(f"não publicado (404): {url}")
-        r.raise_for_status()
-        if ja and r.status_code != 206:  # servidor ignorou o Range: recomeça
-            ja = 0
-        total = ja + int(r.headers.get("Content-Length", 0))
-        modo = "ab" if ja else "wb"
-        feito, t0 = ja, time.time()
-        with open(parcial, modo) as f:
-            for bloco in r.iter_content(chunk_size=4 << 20):
-                f.write(bloco)
-                feito += len(bloco)
-                vel = (feito - ja) / max(time.time() - t0, 1e-6) / 1e6
-                print(f"\r  {feito / 1e6:,.0f} / {total / 1e6:,.0f} MB  ({vel:,.1f} MB/s)   ",
-                      end="", flush=True)
-    print()
-    parcial.rename(destino)
-    return destino
 
 
 # ------------------------------------------------------------------ leitura do zip
@@ -186,6 +157,10 @@ def main():
     p.add_argument("--ufs", nargs="+", default=UFS, type=str.upper)
     p.add_argument("--zip", type=Path, help="Processar um zip já baixado (a UF é lida do nome)")
     p.add_argument("--apagar-zip", action="store_true", help="Apagar o zip após processar")
+    p.add_argument("--completo", action="store_true",
+                   help="Baixar o zip inteiro do TSE (padrão: baixar só os logs de dentro dele)")
+    p.add_argument("--conexoes", type=int, default=8, help="Downloads simultâneos no modo só-logs")
+    p.add_argument("--url", help=argparse.SUPPRESS)  # para testes: modelo de URL alternativo
     p.add_argument("--refazer", action="store_true", help="Reprocessar UFs já processadas")
     p.add_argument("--processos", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     a = p.parse_args()
@@ -205,11 +180,34 @@ def main():
             print(f"{uf}: já processado ({saida.name}); use --refazer para refazer")
             continue
         print(f"\n=== {uf} ({ano}, {turno}º turno) ===")
+        url = (a.url or URL).format(ano=ano, turno=turno, uf=uf)
+        completo = PASTA / f"arqurna_{ano}_{turno}t_{uf}.zip"
         try:
-            caminho = zip_local or baixar(URL.format(ano=ano, turno=turno, uf=uf),
-                                          PASTA / f"arqurna_{ano}_{turno}t_{uf}.zip")
+            if zip_local:
+                caminho = zip_local
+            elif completo.exists():  # zip inteiro já baixado antes
+                print(f"  usando o zip completo já baixado: {completo.name}")
+                caminho = completo
+            elif a.completo:
+                caminho = baixar_completo(url, completo)
+            else:
+                try:
+                    caminho, n_total, n_falhas = baixar_so_logs(
+                        url, PASTA / f"logs_brutos_{ano}_{turno}t_{uf}.zip", EXT_LOG, a.conexoes)
+                except SemDownloadParcial:
+                    print("  servidor não aceitou baixar só os logs; baixando o zip completo")
+                    caminho = baixar_completo(url, completo)
+                else:
+                    if n_falhas:
+                        print(f"  ! {n_falhas} de {n_total:,} logs não vieram. Rode o mesmo comando de novo "
+                              "para buscar só os que faltam (o resto já está salvo).")
+                        continue
+        except KeyboardInterrupt:
+            print("\nInterrompido. Rode o mesmo comando para continuar de onde parou.")
+            return 1
         except Exception as e:
             print(f"  ! falha no download: {e}")
+            print("    Rode o mesmo comando de novo: ele continua de onde parou.")
             continue
         df = processar_zip(caminho, uf, a.processos)
         if df.empty:
@@ -222,7 +220,7 @@ def main():
         print(f"  hora média {df['hora_media'].mean():.2f}h | "
               f"{df['votos_apos_17'].sum():,} votos após 17h "
               f"({df['votos_apos_17'].sum() / df['votos_log'].sum():.2%}) | salvo em {saida.name}")
-        if a.apagar_zip and not zip_local:
+        if a.apagar_zip and not zip_local and caminho == completo:
             caminho.unlink()
             print("  zip apagado")
     print("\nPronto. Rode:  streamlit run painel.py")
