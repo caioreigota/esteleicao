@@ -30,6 +30,8 @@ MIN_SECOES_MUNICIPIO = 5  # abaixo disso, a referência é a UF
 
 def resumo(df: pd.DataFrame, por: list[str] | None = None) -> pd.DataFrame:
     """Média, desvio padrão etc. da taxa de abstenção das seções, por grupo."""
+    df = df[list(dict.fromkeys((por or []) + ["taxa_abstencao", "aptos", "abstencoes"]))]  # só o necessário
+
     def _agg(g):
         t = g["taxa_abstencao"]
         mediana = t.median()
@@ -121,6 +123,8 @@ PISO_ESCALA_HORARIO = 0.15  # horas (9 min): evita z enorme em municípios muito
 
 def resumo_coluna(df: pd.DataFrame, col: str, por: list[str] | None = None) -> pd.DataFrame:
     """Média, desvio padrão, mediana e percentis de uma métrica qualquer, por grupo."""
+    df = df[list(dict.fromkeys((por or []) + [col]))]
+
     def _agg(g):
         x = g[col].dropna()
         return pd.Series({"secoes": len(x), "media": x.mean(), "desvio_padrao": x.std(ddof=1),
@@ -138,6 +142,53 @@ def _z_robusto(x: pd.Series, grupos: list[pd.Series], piso: float) -> pd.Series:
     return (x - med) / np.maximum(mad, piso), med, np.maximum(mad, piso)
 
 
+def corrigir_fuso(logs: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reaplica a regra de fuso atual (logs_urna.fuso_por_abertura) a logs já processados,
+    sem precisar baixar de novo. As contagens por hora local (h/s/m00..23) permitem
+    recalcular exatamente os votos após 17h; horários médios são deslocados em horas inteiras.
+    """
+    from logs_urna import ABERTURA, ENCERRAMENTO, fuso_por_abertura
+    if logs is None or logs.empty or "h00" not in logs:
+        return logs
+    logs = logs.copy()
+    ref_local = logs["abertura"].fillna(logs["primeiro_voto"]) + logs["fuso"]
+    novo = pd.Series([fuso_por_abertura(r, u) for r, u in zip(ref_local, logs["uf"].astype(str))],
+                     index=logs.index)
+    # harmoniza pelo fuso mais comum do município (como no processamento)
+    novo = novo.groupby([logs["uf"], logs["cd_municipio"]]).transform(lambda s: s.mode().iloc[0])
+    delta = novo - logs["fuso"]
+    m = delta != 0
+    if not m.any():
+        return logs
+    for c in ["hora_media", "hora_mediana", "hora_p90", "primeiro_voto", "ultimo_voto", "abertura"]:
+        if c in logs:
+            logs.loc[m, c] = logs.loc[m, c] - delta[m]
+    if "abertura_atrasada_min" in logs:
+        logs.loc[m, "abertura_atrasada_min"] = ((logs.loc[m, "abertura"] - ABERTURA) * 60).clip(lower=0)
+    H = logs.loc[m, [f"h{h:02d}" for h in range(24)]].to_numpy()
+    S = logs.loc[m, [f"s{h:02d}" for h in range(24)]].to_numpy() if "s00" in logs else None
+    M = logs.loc[m, [f"m{h:02d}" for h in range(24)]].to_numpy() if "m00" in logs else None
+    hora_local = np.arange(24)[None, :]
+    f = novo[m].to_numpy()[:, None]
+    apos = hora_local >= ENCERRAMENTO + f
+    n = logs.loc[m, "votos_log"].to_numpy()
+    va = (H * apos).sum(1)
+    logs.loc[m, "votos_apos_17"] = va
+    logs.loc[m, "pct_apos_17"] = va / np.maximum(n, 1)
+    logs.loc[m, "pct_ultima_hora"] = (H * (hora_local == ENCERRAMENTO - 1 + f)).sum(1) / np.maximum(n, 1)
+    logs.loc[m, "pct_manha"] = (H * (hora_local < 12 + f)).sum(1) / np.maximum(n, 1)
+    if S is not None:
+        logs.loc[m, "pct_sem_bio_apos_17"] = np.where(va > 0, (S * apos).sum(1) / np.maximum(va, 1), np.nan)
+    if M is not None and "votos_manual_apos_17" in logs:
+        logs.loc[m, "votos_manual_apos_17"] = (M * apos).sum(1)
+    for c in ["ociosa_antes_17_min", "intervalo_med_apos_17_s"]:  # não dá para recalcular sem o log bruto
+        if c in logs:
+            logs.loc[m, c] = np.nan
+    logs.loc[m, "fuso"] = novo[m]
+    return logs
+
+
 def juntar_horario(secoes: pd.DataFrame, logs: pd.DataFrame | None) -> pd.DataFrame:
     """
     Junta as métricas dos logs às seções e calcula:
@@ -153,7 +204,7 @@ def juntar_horario(secoes: pd.DataFrame, logs: pd.DataFrame | None) -> pd.DataFr
     if logs is None or logs.empty:
         return secoes.assign(tem_log=False)
     chave = ["uf", "cd_municipio", "zona", "secao"]
-    logs = logs.copy()
+    logs = corrigir_fuso(logs)
     for c in ["cd_municipio", "zona", "secao"]:
         logs[c] = logs[c].astype("Int32")
     logs["uf"] = logs["uf"].astype(str)
@@ -261,10 +312,12 @@ def z_proporcao(df: pd.DataFrame, num: pd.Series, den: pd.Series, min_den: int =
 def votos_por_hora(df: pd.DataFrame, prefixo: str = "h") -> pd.Series:
     """Votos por hora em horário equivalente (Brasília), somando as seções de df.
     prefixo: "h" = todos os votos, "s" = sem digital, "m" = liberação manual."""
-    d = df[df["tem_log"]]
     tot = np.zeros(30)
     cols = [f"{prefixo}{h:02d}" for h in range(24)]
-    if d.empty or cols[0] not in d:
+    if cols[0] not in df:
+        return pd.Series(tot[3:27], index=range(24))
+    d = df.loc[df["tem_log"].astype(bool), ["fuso"] + cols]
+    if d.empty:
         return pd.Series(tot[3:27], index=range(24))
     for fuso, g in d.groupby("fuso"):
         idx = np.arange(24) - int(fuso) + 3   # hora local h -> hora equivalente h - fuso

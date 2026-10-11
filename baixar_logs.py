@@ -123,7 +123,7 @@ def processar_zip(caminho: Path, uf: str, processos: int) -> pd.DataFrame:
         abertura = min(aberturas) if aberturas else None
         linhas.append({"cd_municipio": mun, "zona": zona, "secao": secao,
                        "_votos": votos, "_hab": hab, "_abertura": abertura,
-                       "_fuso": estimar_fuso(abertura, int(votos[0]) if len(votos) else None),
+                       "_fuso": estimar_fuso(abertura, int(votos[0]) if len(votos) else None, uf),
                        "n_logs": len(logs), "n_urnas": len(set().union(*[l["urnas"] for l in logs])),
                        "dia": next((l["dia"] for l in logs if l["dia"]), None)})
     fuso_mun = defaultdict(Counter)

@@ -144,13 +144,30 @@ def ler_eventos(texto: str) -> dict:
             "dia": datetime.strptime(dia_eleicao, "%d/%m/%Y").date().isoformat(), "ident": ident}
 
 
-def estimar_fuso(abertura_s: int | None, primeiro_voto_s: int | None) -> int:
+# fuso oficial de cada UF em relação a Brasília (o resto é 0)
+FUSO_OFICIAL = {"AC": -2, "AM": -1, "MT": -1, "MS": -1, "RO": -1, "RR": -1}
+
+
+def fuso_por_abertura(ref_horas: float | None, uf: str | None = None) -> int:
+    """
+    Fuso (horas inteiras) entre o relógio da urna e Brasília, a partir da hora local em que
+    a urna abriu (ou do primeiro voto). Usa o fuso oficial da UF, salvo quando a abertura
+    destoa dele em mais de 45 min — casos reais: oeste do AM (-2), Fernando de Noronha (+1),
+    leste do MT que usa o horário de Brasília (0). No exterior (ZZ) vale só o dado.
+    """
+    if ref_horas is None or ref_horas != ref_horas:  # None ou NaN
+        return FUSO_OFICIAL.get(uf, 0)
+    if uf and uf != "ZZ":
+        padrao = FUSO_OFICIAL.get(uf, 0)
+        if abs(ref_horas - ABERTURA - padrao) <= 0.75:
+            return padrao
+    return int(np.clip(round(ref_horas - ABERTURA), -3, 2))
+
+
+def estimar_fuso(abertura_s: int | None, primeiro_voto_s: int | None, uf: str | None = None) -> int:
     """Diferença inteira (em horas) entre o relógio da urna e o horário de Brasília."""
     ref = abertura_s if abertura_s is not None else primeiro_voto_s
-    if ref is None:
-        return 0
-    fuso = int(round(ref / 3600 - ABERTURA))
-    return int(np.clip(fuso, -3, 2))
+    return fuso_por_abertura(None if ref is None else ref / 3600, uf)
 
 
 def _maior_sequencia(mask: np.ndarray) -> int:

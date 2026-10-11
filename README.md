@@ -83,6 +83,12 @@ python baixar_dados.py --ano 1999 --zip dados/teste_detalhe_votacao_secao.zip
 for f in dados/teste_arqurna_*.zip; do python baixar_logs.py --zip $f; done
 ```
 
+## Publicar na internet (servidor Windows)
+
+Veja [deploy/LEIAME_WINDOWS.md](deploy/LEIAME_WINDOWS.md): `python deploy/empacotar.py` gera
+`pacote_servidor.zip` (código + dados processados) e o script
+`deploy/instalar_servico_windows.ps1` instala o painel como serviço do Windows via NSSM.
+
 ## O painel
 
 - **Barra lateral**: escolhe eleição/turno, desce de nível (UF → município → zona → seção) e ajusta o critério de alerta.

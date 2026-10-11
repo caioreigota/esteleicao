@@ -2,6 +2,8 @@
 Painel de abstenção e horário de votação por seção eleitoral.
     streamlit run painel.py
 """
+from __future__ import annotations
+
 from pathlib import Path
 
 import numpy as np
@@ -24,15 +26,57 @@ def arquivos_logs(caminho_secoes: Path) -> list[Path]:
     return sorted(PASTA.glob(f"logs_{sufixo}_*.parquet"))
 
 
-@st.cache_data(show_spinner="Carregando e calculando estatísticas…")
-def carregar(caminho: str, _assinatura: tuple) -> pd.DataFrame:
+# cache_resource: UMA cópia em memória compartilhada por todos os visitantes (a base tem ~600 MB;
+# cache_data copiaria tudo a cada interação). O código nunca altera `base` no lugar.
+# `assinatura` (nomes + datas dos arquivos) faz o cache recarregar quando chegam logs novos.
+@st.cache_resource(show_spinner="Carregando e calculando estatísticas…", max_entries=2)
+def carregar(caminho: str, assinatura: tuple, incluir_zz: bool) -> pd.DataFrame:
     df = pontuar_secoes(pd.read_parquet(caminho))
     arqs = arquivos_logs(Path(caminho))
     logs = pd.concat([pd.read_parquet(a) for a in arqs], ignore_index=True) if arqs else None
     df = juntar_horario(df, logs)
-    for c in ["uf", "municipio"]:
-        df[c] = df[c].astype("category")
+    if not incluir_zz:
+        df = df[df["uf"].astype(str) != "ZZ"]
+    # tipos compactos: menos memória no servidor
+    for c in df.select_dtypes("float64").columns:
+        df[c] = df[c].astype("float32")
+    for c in df.select_dtypes("int64").columns:
+        df[c] = pd.to_numeric(df[c], downcast="integer")
+    for c in ["uf", "municipio", "nome_local", "endereco_local", "dia", "referencia", "transito"]:
+        if c in df:
+            df[c] = df[c].astype("category")
+    # .copy() consolida as colunas num bloco contíguo; sem isso a base fica "fragmentada"
+    # e cada visitante força o pandas a copiar tudo de novo a cada interação.
+    df = df.reset_index(drop=True).copy()
+    _devolver_memoria()
     return df
+
+
+def _devolver_memoria():
+    """Devolve ao sistema a memória temporária da carga (efeito no Linux; inofensivo no Windows/Mac)."""
+    import ctypes
+    import gc
+    import sys
+    gc.collect()
+    if sys.platform.startswith("linux"):
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
+
+
+def filtrar(d: pd.DataFrame, mascara: pd.Series, colunas: list[str] | None = None) -> pd.DataFrame:
+    """Filtra linhas sem copiar a base inteira quando a máscara é toda verdadeira."""
+    if colunas is not None:
+        return d.loc[mascara, list(dict.fromkeys(c for c in colunas if c in d))]
+    return d if bool(mascara.all()) else d[mascara]
+
+
+def com_log(d: pd.DataFrame) -> pd.DataFrame:
+    """Seções com log. Se quase todas têm, devolve a própria base (sem copiar ~300 MB):
+    nas seções sem log as colunas do log estão vazias (NaN) e ficam fora dos cálculos."""
+    m = d["tem_log"].astype(bool)
+    return d if m.mean() >= 0.9 else d[m]
 
 
 def pct(x, casas=1):
@@ -62,6 +106,31 @@ EIXO_Z = {
 }
 
 
+AMOSTRA_FUNDO = 15_000  # pontos "normais" desenhados nos gráficos de dispersão (os destacados vão todos)
+
+
+def histograma(valores: pd.Series, n_bins: int, cor: str, log_y: bool = False) -> go.Figure:
+    """Histograma calculado no servidor: envia ao navegador só as alturas das barras,
+    não as ~500 mil seções (economiza memória e banda)."""
+    v = pd.to_numeric(valores, errors="coerce").dropna().to_numpy(dtype=float)
+    fig = go.Figure()
+    if len(v):
+        cont, bordas = np.histogram(v, bins=n_bins)
+        centros, larg = (bordas[:-1] + bordas[1:]) / 2, np.diff(bordas)
+        fig.add_trace(go.Bar(x=centros, y=cont, width=larg, marker_color=cor, marker_line_width=0,
+                             hovertemplate="%{x:.3g}: %{y} seções<extra></extra>"))
+    fig.update_layout(bargap=0, yaxis_type="log" if log_y else None)
+    return fig
+
+
+def amostrar_fundo(d: pd.DataFrame, destaque: pd.Series) -> pd.DataFrame:
+    """Todos os pontos destacados + uma amostra dos demais (fundo cinza)."""
+    fundo = d[~destaque]
+    if len(fundo) > AMOSTRA_FUNDO:
+        fundo = fundo.sample(AMOSTRA_FUNDO, random_state=1)
+    return pd.concat([fundo, d[destaque]])
+
+
 def linha_df(s: pd.Series) -> pd.DataFrame:
     """Uma seção (Series) como DataFrame com tipos numéricos corretos."""
     return pd.DataFrame([s]).infer_objects()
@@ -76,14 +145,11 @@ if not arquivos:
 with st.sidebar:
     st.header("🗳️ Abstenção por seção")
     arquivo = st.selectbox("Eleição / turno", arquivos, format_func=lambda p: p.stem.replace("secoes_", ""))
-    assinatura = tuple((a.name, a.stat().st_mtime) for a in [arquivo, *arquivos_logs(arquivo)])
-    base = carregar(str(arquivo), assinatura)
-    tem_logs = bool(base["tem_log"].any())
-
     st.subheader("Navegação")
     incluir_zz = st.checkbox("Incluir exterior (ZZ)", value=False)
-    if not incluir_zz:
-        base = base[base["uf"] != "ZZ"]
+    assinatura = tuple((a.name, a.stat().st_mtime) for a in [arquivo, *arquivos_logs(arquivo)])
+    base = carregar(str(arquivo), assinatura, incluir_zz)
+    tem_logs = bool(base["tem_log"].any())
 
     ufs = sorted(base["uf"].unique().tolist())
     uf = st.selectbox("Estado", [TODOS] + ufs)
@@ -177,10 +243,14 @@ def sinalizar(d: pd.DataFrame) -> pd.DataFrame:
     else:
         f_man = pd.Series(False, index=d.index)
     n = f_abst.astype(int) + f_17.astype(int) + f_man.astype(int)
-    rot = (np.where(f_abst, "abstenção baixa · ", "") + np.where(f_17, "voto após 17h · ", "")
-           + np.where(f_man, "liberação manual · ", ""))
-    return d.assign(f_abst=f_abst, f_17=f_17, f_man=f_man, n_criterios=n,
-                    criterios_cumpridos=pd.Series(rot, index=d.index).str.rstrip(" · "),
+    rot = pd.Series("", index=d.index, dtype=object)
+    alguma = n > 0
+    if alguma.any():  # monta o texto só para as poucas seções que cumprem algum critério
+        partes = pd.concat([f_abst[alguma].map({True: "abstenção baixa", False: ""}),
+                            f_17[alguma].map({True: "voto após 17h", False: ""}),
+                            f_man[alguma].map({True: "liberação manual", False: ""})], axis=1)
+        rot[alguma] = partes.apply(lambda r: " · ".join(x for x in r if x), axis=1)
+    return d.assign(f_abst=f_abst, f_17=f_17, f_man=f_man, n_criterios=n, criterios_cumpridos=rot,
                     alerta=np.where(n >= min_crit, "sinalizada", "normal"))
 
 
@@ -190,6 +260,21 @@ df = sinalizar(df)
 nivel = ("Brasil" if uf == TODOS else uf if mun == TODOS else
          f"{df['municipio'].iloc[0]} / {uf}" + (f" · Zona {zona}" if zona != TODOS else ""))
 st.title(nivel)
+st.caption("Fonte: dados abertos do TSE (resultados por seção e logs das urnas). Seções sinalizadas são "
+           "**desvios estatísticos** em relação ao próprio município, não prova de irregularidade: a maioria "
+           "tem explicação comum (fila, perfil do eleitorado, cadastro biométrico, leitor com defeito). "
+           "Veja \"Como ler este painel\" abaixo.")
+with st.expander("ℹ️ Como ler este painel"):
+    st.markdown(
+        "- **Abstenção baixa**: abstenção abaixo do esperado para o município, levando em conta o tamanho da "
+        "seção e a variação natural entre seções (z ajustado).\n"
+        "- **Voto após 17h**: é permitido — quem está na fila às 17h vota. Fica sinalizado quando uma parte "
+        "grande dos votos é depois das 17h e a seção destoa das outras da mesma escola.\n"
+        "- **Liberação manual**: eleitor com digital cadastrada que não foi reconhecida e foi liberado pelo "
+        "mesário. Acontece com idosos, digitais gastas e leitores sujos ou com defeito.\n"
+        "- Com cerca de 470 mil seções, dezenas a centenas aparecem como extremas só por acaso. Para "
+        "investigar um caso, compare com as outras seções da mesma escola, consulte o boletim de urna e o "
+        "log da seção no site do TSE e, se houver dúvida, procure o TRE do estado.")
 
 r = resumo(df).iloc[0]
 c = st.columns(7)
@@ -207,16 +292,17 @@ c[6].metric("🚩 Sinalizadas", int((df["alerta"] == "sinalizada").sum()),
             help=f"Seções que cumprem pelo menos {min_crit} dos critérios: abstenção baixa, "
                  "voto após 17h, liberação manual")
 
-dl = df[df["tem_log"]]
+dl = com_log(df)
 if len(dl):
     c = st.columns(7)
-    c[0].metric("Seções com log", f"{len(dl):,}".replace(",", "."))
+    n_com_log = int(dl["tem_log"].astype(bool).sum())
+    c[0].metric("Seções com log", f"{n_com_log:,}".replace(",", "."))
     c[1].metric("Hora média", hora((dl["hora_media"] * dl["votos_log"]).sum() / dl["votos_log"].sum()),
                 help="Média ponderada pelo número de votos, em horário de Brasília (8h–17h)")
     c[2].metric("Desvio (seções)", f"{dl['hora_media'].std() * 60:.0f} min",
                 help="Desvio padrão da hora média de cada seção")
     c[3].metric("Votos após 17h", pct(dl["votos_apos_17"].sum() / dl["votos_log"].sum(), 2))
-    c[4].metric("Seções c/ voto 17h+", pct((dl["votos_apos_17"] > 0).mean()))
+    c[4].metric("Seções c/ voto 17h+", pct((dl["votos_apos_17"] > 0).sum() / max(n_com_log, 1)))
     c[5].metric("Corr. abst. × hora", f"{dl['taxa_abstencao'].rank().corr(dl['hora_media'].rank()):+.2f}",
                 help="Spearman entre taxa de abstenção e hora média. Negativo = onde se falta menos, "
                      "vota-se mais tarde (esperado: mais eleitores → mais fila).")
@@ -259,11 +345,13 @@ def detalhe_secao(s: pd.Series):
 
     zona_df = base[(base["cd_municipio"] == s["cd_municipio"]) & (base["zona"] == s["zona"])]
     mun_df = base[base["cd_municipio"] == s["cd_municipio"]]
-    uf_df = base[base["uf"] == s["uf"]]
+    uf_tx = base.loc[base["uf"] == s["uf"], "taxa_abstencao"]
     comp = pd.DataFrame({
         "nível": ["Esta seção", f"Zona {s['zona']}", "Município", s["uf"], "Brasil"],
-        "media": [s["taxa_abstencao"]] + [d["taxa_abstencao"].mean() for d in (zona_df, mun_df, uf_df, base)],
-        "dp": [0] + [d["taxa_abstencao"].std() for d in (zona_df, mun_df, uf_df, base)],
+        "media": [s["taxa_abstencao"]] + [x.mean() for x in (zona_df["taxa_abstencao"], mun_df["taxa_abstencao"],
+                                                             uf_tx, base["taxa_abstencao"])],
+        "dp": [0] + [x.std() for x in (zona_df["taxa_abstencao"], mun_df["taxa_abstencao"],
+                                       uf_tx, base["taxa_abstencao"])],
     })
     a, b = st.columns(2)
     fig = go.Figure(go.Bar(x=comp["nível"], y=comp["media"],
@@ -420,7 +508,7 @@ with aba_comp:
                                           "mad", "p05", "p95", "minimo", "maximo"]})
 
 with aba_dist:
-    fig = px.histogram(df, x="taxa_abstencao", nbins=80, color_discrete_sequence=["#33415c"])
+    fig = histograma(df["taxa_abstencao"], 80, "#33415c")
     for k, estilo in [(0, "solid"), (1, "dash"), (-1, "dash"), (2, "dot"), (-2, "dot")]:
         x = r.media + k * r.desvio_padrao
         fig.add_vline(x=x, line_dash=estilo, line_color=COR_ALTA if k else "black",
@@ -433,10 +521,9 @@ with aba_dist:
                "O z ajustado, comparando cada seção com o próprio município, é mais útil para achar pontos.")
 
 with aba_funil:
-    pontos = df.assign(_grupo=np.where(df["f_abst"], "abstenção baixa", "demais"))
-    normais = pontos[pontos["_grupo"] == "demais"]
-    if len(normais) > 60_000:  # mantém o gráfico leve em nível Brasil
-        pontos = pd.concat([normais.sample(60_000, random_state=1), pontos[pontos["_grupo"] != "demais"]])
+    pontos = df[["aptos", "taxa_abstencao", "municipio", "zona", "secao"]].assign(
+        _grupo=np.where(df["f_abst"], "abstenção baixa", "demais"))
+    pontos = amostrar_fundo(pontos, pontos["_grupo"] != "demais")
     fig = go.Figure()
     for nome, cor in [("demais", COR_NORMAL), ("abstenção baixa", COR_BAIXA)]:
         d = pontos[pontos["_grupo"] == nome]
@@ -509,7 +596,7 @@ SEM_LOGS = ("Ainda não há logs de urna para este nível. Baixe e processe os l
             "Depois recarregue o painel. Comece por um estado pequeno: os arquivos do TSE são grandes.")
 
 with aba_hora:
-    dh = df[df["tem_log"]]
+    dh = com_log(df)
     if dh.empty:
         st.info(SEM_LOGS)
     else:
@@ -559,15 +646,14 @@ with aba_hora:
 
         a, b = st.columns(2)
         m, sd = dh["hora_media"].mean(), dh["hora_media"].std()
-        fig = px.histogram(dh, x="hora_media", nbins=80, color_discrete_sequence=["#33415c"])
+        fig = histograma(dh["hora_media"], 80, "#33415c")
         for k, estilo in [(0, "solid"), (2, "dot"), (3, "dash")]:
             fig.add_vline(x=m + k * sd, line_dash=estilo, line_color=COR_ALTA if k else "black",
                           annotation_text="média" if k == 0 else f"+{k} dp")
         fig.update_layout(title="Hora média do voto, por seção", xaxis_title="hora (decimal)",
                           yaxis_title="seções", height=380)
         a.plotly_chart(fig, width="stretch")
-        fig = px.histogram(dh[dh["votos_apos_17"] > 0], x="pct_apos_17", nbins=60,
-                           color_discrete_sequence=[COR_ALTA], log_y=True)
+        fig = histograma(dh.loc[dh["votos_apos_17"] > 0, "pct_apos_17"], 60, COR_ALTA, log_y=True)
         fig.update_layout(title="Seções com votos após 17h: % dos votos depois das 17h (escala log)",
                           xaxis_tickformat=".0%", xaxis_title="% dos votos após 17h", yaxis_title="seções",
                           height=380)
@@ -577,7 +663,9 @@ with aba_hora:
         cols = [c for c in ["uf", "municipio", "zona", "secao", "votos_apos_17", "pct_apos_17", "sinais",
                             "ultimo_voto", "hora_media", "z_horario", "dif_local_min", "pct_sem_bio_apos_17",
                             "ociosa_antes_17_min", "taxa_abstencao", "votos_log", "nome_local"] if c in dh]
-        top = dh.sort_values(["pct_apos_17", "votos_apos_17"], ascending=False).head(500)
+        idx_top = dh[["pct_apos_17", "votos_apos_17"]].sort_values(
+            ["pct_apos_17", "votos_apos_17"], ascending=False).head(500).index
+        top = dh.loc[idx_top]
         ev_h = st.dataframe(
             top[cols], hide_index=True, width="stretch", height=380, on_select="rerun",
             selection_mode="single-row", key="tab_hora",
@@ -596,7 +684,7 @@ with aba_hora:
 
 # ---------------------------------------------------------------- sem digital
 with aba_dig:
-    dd = df[df["tem_log"]] if "pct_sem_digital" in df else df.iloc[0:0]
+    dd = com_log(df) if "pct_sem_digital" in df else df.iloc[0:0]
     if dd.empty:
         st.info(SEM_LOGS if not tem_logs else
                 "Os logs foram processados por uma versão antiga. Rode `python baixar_logs.py --refazer`.")
@@ -658,12 +746,12 @@ with aba_dig:
         st.plotly_chart(fig, width="stretch")
 
         # funil: proporção × número de votos
-        pts = dd[dd[col_z].notna()]
+        pts = filtrar(dd, dd[col_z].notna(), ["municipio", "zona", "secao", col_p, col_z, col_esp,
+                                              "votos_log", "votos_sem_cadastro"])
         den = pts["votos_log"] if total_ind else pts["votos_log"] - pts["votos_sem_cadastro"]
         flag = pts[col_z] >= limite
-        if (~flag).sum() > 60_000:
-            keep = pts[~flag].sample(60_000, random_state=1).index.union(pts[flag].index)
-            pts, den, flag = pts.loc[keep], den.loc[keep], flag.loc[keep]
+        keep = amostrar_fundo(pts[[]], flag).index
+        pts, den, flag = pts.loc[keep], den.loc[keep], flag.loc[keep]
         fig = go.Figure()
         for nome, m, cor, tam, op in [("demais", ~flag, COR_NORMAL, 4, .35),
                                       (f"z ≥ {limite} (acima do esperado no município)", flag, COR_ALTA, 8, .95)]:
@@ -679,7 +767,7 @@ with aba_dig:
                           yaxis_title=ind, yaxis_tickformat=".0%", height=520, legend=dict(orientation="h"))
         st.plotly_chart(fig, width="stretch")
 
-        sel = dd[flag.reindex(dd.index, fill_value=False) | (dd[col_z] >= limite)].sort_values(col_z, ascending=False)
+        sel = dd[dd[col_z] >= limite].sort_values(col_z, ascending=False)
         st.write(f"**{len(sel):,}** seções com {ind.lower()} {limite}+ desvios acima do esperado para o município. "
                  "Selecione uma linha para ver o detalhe.")
         cols = [c for c in ["uf", "municipio", "zona", "secao", col_z, col_p, col_esp, "pct_sem_cadastro",
@@ -709,7 +797,10 @@ with aba_dig:
 
 # ---------------------------------------------------------------- cruzamento
 with aba_cruz:
-    dc = df[df["tem_log"] & df["score_cruzado"].notna()] if tem_logs else df.iloc[0:0]
+    mask_c = (df["tem_log"] & df["score_cruzado"].notna()) if tem_logs else pd.Series(False, index=df.index)
+    dc = filtrar(df, mask_c, ["municipio", "zona", "secao", "score_cruzado", "taxa_abstencao", "hora_media",
+                              "pct_apos_17", "pct_sem_digital", "sinais"]
+                 + [c for crit in CRITERIOS.values() for c in crit[:2]])
     if dc.empty:
         st.info(SEM_LOGS)
     else:
@@ -726,8 +817,7 @@ with aba_cruz:
             st.stop()
         destaque = dc["score_cruzado"] >= limite_cruz
         pontos = dc
-        if (~destaque).sum() > 60_000:
-            pontos = pd.concat([dc[~destaque].sample(60_000, random_state=1), dc[destaque]])
+        pontos = amostrar_fundo(dc, destaque)
         hover = (pontos["municipio"].astype(str) + " · Z" + pontos["zona"].astype(str) + " · S"
                  + pontos["secao"].astype(str) + "<br>abstenção " + (pontos["taxa_abstencao"] * 100).round(1).astype(str)
                  + "% · hora média " + pontos["hora_media"].map(hora) + " · após 17h "
@@ -759,7 +849,8 @@ with aba_cruz:
                           legend=dict(orientation="h"))
         st.plotly_chart(fig, width="stretch")
 
-        sel = dc[destaque].sort_values(["score_cruzado", "n_sinais"], ascending=False)
+        sel = df[mask_c & (df["score_cruzado"] >= limite_cruz)].sort_values(["score_cruzado", "n_sinais"],
+                                                                               ascending=False)
         st.write(f"**{len(sel):,}** seções com {NOME_CRUZ} (todos ≥ {limite_cruz}), de {len(dc):,} com log. "
                  "Ordenadas pelo score; a coluna *sinais* resume o que o log mostra.")
         cols = [c for c in ["uf", "municipio", "zona", "secao", "score_cruzado", "n_sinais", "sinais",
