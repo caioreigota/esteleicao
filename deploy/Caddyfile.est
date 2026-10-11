@@ -1,0 +1,21 @@
+# Bloco do Duad Live, importado pelo Caddyfile do veracibot
+# (C:\Git\veracibot\deploy\windows\Caddyfile) com a linha:
+#   import C:/Git/duadlive/deploy/Caddyfile.duad
+#
+# AJUSTE o caminho em "root" se o repositorio estiver em outra pasta no servidor.
+
+duad.live {
+	root * C:/Git/duadlive/site
+	encode gzip
+
+	# Na fase de testes, sempre servir a versao mais recente do arquivo
+	header Cache-Control "no-cache"
+
+	# A raiz abre site/index.html (estudio e visualizador); o banco de testes fica em /proto.html
+
+	file_server
+}
+
+www.duad.live {
+	redir https://esteleicao.com{uri} permanent
+}
